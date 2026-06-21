@@ -22,7 +22,12 @@ from urllib.error import HTTPError, URLError
 from tldextract import extract as tld_extract
 
 # ============= 配置 =============
-DICT_FILE = "/opt/sec-tools/dict/subdomains_large.txt"
+# 动态定位字典文件（优先 skill 目录，回退系统路径）
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SKILL_ROOT = os.path.dirname(_SCRIPT_DIR)
+DICT_FILE = os.path.join(_SKILL_ROOT, "references", "subdomains_large.txt")
+if not os.path.exists(DICT_FILE):
+    DICT_FILE = "/opt/sec-tools/dict/subdomains_large.txt"
 MAX_WORKERS = 20          # DNS 解析并发数
 DNS_TIMEOUT = 5           # DNS 超时
 SUBFINDER_TIMEOUT = 120   # subfinder 超时
