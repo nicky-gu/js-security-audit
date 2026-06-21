@@ -1,306 +1,565 @@
 #!/usr/bin/env python3
 """
-域名资产发现器
-功能：
-1. 从公司名/初始URL发现关联主域名
-2. 子域名枚举（subfinder + crt.sh + dns字典）
-3. 输出所有可访问的域名列表
+域名资产发现 v2 - 全面增强版
+支持：多模式输入、多源主域名发现、大规模子域名枚举
 
-用法: python3 discover_domains.py <公司名或URL> [输出文件]
+输入模式：
+- URL: https://www.example.com
+- 域名: www.example.com / example.com
+- 公司名: 华为、示例公司
+
+用法:
+    python3 discover_domains.py <输入> [输出JSON文件]
+    python3 discover_domains.py "https://www.example.com" /tmp/output.json
+    python3 discover_domains.py "example.com" /tmp/output.json
+    python3 discover_domains.py "华为" /tmp/output.json
 """
-import sys, json, re, subprocess, urllib.request, urllib.parse, socket, time
 
-def extract_main_domain(url):
-    """从URL提取主域名（如 www.example.com → example.com）"""
-    domain = re.sub(r'^https?://', '', url).split('/')[0].split(':')[0]
-    # 去掉 www. 前缀
+import sys, re, json, os, subprocess, time, socket, concurrent.futures
+from urllib.parse import urlparse, quote
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+from tldextract import extract as tld_extract
+
+# ============= 配置 =============
+DICT_FILE = "/opt/sec-tools/dict/subdomains_large.txt"
+MAX_WORKERS = 20          # DNS 解析并发数
+DNS_TIMEOUT = 5           # DNS 超时
+SUBFINDER_TIMEOUT = 120   # subfinder 超时
+CRT_TIMEOUT = 30          # crt.sh 超时
+HTTP_TIMEOUT = 10         # HTTP 验证超时
+
+# ============= 硬编码映射 =============
+MAPPINGS = {
+    '华为': ['huawei.com', 'huawei.cn'],
+    '腾讯': ['tencent.com', 'qq.com'],
+    '阿里': ['alibaba.com', 'aliyun.com'],
+    '阿里巴巴': ['alibaba.com', 'aliyun.com'],
+    '字节': ['bytedance.com', 'tiktok.com'],
+    '字节跳动': ['bytedance.com', 'tiktok.com'],
+    '小米': ['mi.com', 'xiaomi.com'],
+    '比亚迪': ['byd.com', 'byd.com.cn'],
+    '吉利': ['geely.com', 'geely.com.cn'],
+    '百度': ['baidu.com', 'baidu.com.cn'],
+    '京东': ['jd.com', 'jd.com.cn'],
+    '美团': ['meituan.com', 'meituan.com.cn'],
+    '拼多多': ['pinduoduo.com'],
+    '蔚来': ['nio.cn', 'nio.com'],
+    '小鹏': ['xiaopeng.com', 'xpeng.com'],
+    '理想': ['lixiang.com', 'li-auto.com'],
+}
+
+# ============= 输入解析 =============
+def parse_input(raw_input):
+    """解析输入为模式识别"""
+    raw = raw_input.strip().lower()
+    
+    # URL 模式
+    if raw.startswith('http://') or raw.startswith('https://'):
+        parsed = urlparse(raw_input.strip())
+        domain = parsed.netloc.split(':')[0]  # 去掉端口
+        return ('url', raw_input.strip(), domain)
+    
+    # 纯域名模式 (包含 . 且没有空格)
+    if re.match(r'^[a-z0-9][-a-z0-9]*\.[a-z]+$', raw, re.I) or \
+       re.match(r'^[a-z0-9][-a-z0-9]*\.[a-z]+\.[a-z]+$', raw, re.I) or \
+       re.match(r'^[a-z0-9][-a-z0-9]*\.[a-z]+\.[a-z]+\.[a-z]+$', raw, re.I):
+        return ('domain', raw_input.strip(), raw_input.strip())
+    
+    # 公司名模式
+    return ('company', raw_input.strip(), raw_input.strip())
+
+def extract_main_domain(domain):
+    """提取注册域（如 www.example.com → example.com）"""
+    ext = tld_extract(domain)
+    return f"{ext.domain}.{ext.suffix}"
+
+def remove_www(domain):
+    """去掉 www. 前缀"""
     if domain.startswith('www.'):
-        domain = domain[4:]
+        return domain[4:]
     return domain
 
-def discover_related_domains(company_name, main_domain):
-    """基于公司名和主域名发现关联域名"""
-    related = set()
-    
-    # 基于主域名的常见变体
-    base = main_domain.rsplit('.', 1)[0]  # example
-    tld = main_domain.rsplit('.', 1)[1]    # com
-    
-    common_suffixes = ['-global', '-group', '-china', '-cn', '-auto', '-corp', 
-                       '-tech', '-auto', 'group', 'global', 'china', 'cn',
-                       'auto', 'tech', 'corp', 'holdings']
-    common_prefixes = ['']
-    
-    for suffix in common_suffixes:
-        if suffix.startswith('-'):
-            related.add(f"{base}{suffix}.{tld}")
-            related.add(f"{base}{suffix}.com")
-        else:
-            related.add(f"{base}{suffix}.{tld}")
-    
-    # 常见 TLD 变体
-    for tld_variant in ['com', 'cn', 'com.cn', 'net', 'org']:
-        if tld_variant != tld:
-            related.add(f"{base}.{tld_variant}")
-            related.add(f"www.{base}.{tld_variant}")
-    
-    # 硬编码大公司映射（可扩展）
-    mappings = {
-        '示例公司': ['example.com', 'example-global.com', 'example.cn'],
-        '华为': ['huawei.com', 'huawei.cn', 'hicloud.com', 'huaweicloud.com'],
-        '腾讯': ['tencent.com', 'qq.com', 'weixin.qq.com', 'tencent-cloud.com'],
-        '阿里': ['alibaba.com', 'aliyun.com', 'taobao.com', 'tmall.com'],
-        '字节': ['bytedance.com', 'tiktok.com', 'douyin.com', 'feishu.cn'],
-        '小米': ['mi.com', 'xiaomi.com', 'miui.com'],
-        '比亚迪': ['byd.com', 'bydauto.com.cn', 'byd.com.cn'],
-        '吉利': ['geely.com', 'geelyauto.com.cn', 'geely.com.cn'],
-    }
-    
-    for key, domains in mappings.items():
-        if key in company_name or company_name in key:
-            for d in domains:
-                related.add(d)
-    
-    return related
-
-def check_domain_reachable(domain, timeout=5):
-    """检查域名是否可解析和访问"""
+def resolve_dns(subdomain):
+    """DNS 解析，成功返回 IP，失败返回 None"""
     try:
-        socket.setdefaulttimeout(timeout)
-        ip = socket.gethostbyname(domain)
-        # 尝试 HTTP 请求
-        req = urllib.request.Request(
-            f"http://{domain}",
-            headers={'User-Agent': 'Mozilla/5.0'},
-            method='HEAD'
-        )
-        try:
-            urllib.request.urlopen(req, timeout=timeout)
-            return True, ip
-        except Exception:
-            return True, ip  # 可解析但HTTP可能返回非200
-    except Exception:
-        return False, None
+        ip = socket.gethostbyname(subdomain)
+        return ip
+    except:
+        return None
 
-def enumerate_subdomains_crtsh(domain):
-    """使用 crt.sh 被动枚举子域名"""
-    subdomains = set()
+def is_ip(target):
+    """检查是否为 IP 地址"""
+    return re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target) is not None
+
+# ============= 主域名发现 =============
+def discover_main_domains(company_name, domain=None):
+    """发现关联主域名"""
+    domains = set()
+    
+    # 如果已经有域名，直接加入
+    if domain and not is_ip(domain):
+        domains.add(domain)
+    
+    # 1. 硬编码映射
+    if company_name in MAPPINGS:
+        for d in MAPPINGS[company_name]:
+            domains.add(d)
+    
+    # 2. 拼音猜测（如果公司名有 ASCII 部分）
+    if not domains and not is_ip(company_name):
+        # 提取拼音部分
+        ascii_parts = re.findall(r'[a-zA-Z]+', company_name)
+        if ascii_parts:
+            base = ''.join(ascii_parts).lower()
+            candidates = [
+                f"www.{base}.com", f"{base}.com",
+                f"www.{base}.cn", f"{base}.cn",
+                f"www.{base}.com.cn", f"{base}.com.cn",
+                f"www.{base}.net", f"{base}.net",
+                f"www.{base}.org", f"{base}.org",
+            ]
+            for url in candidates:
+                d = remove_www(url.replace('https://', '').replace('http://', '').split('/')[0])
+                domains.add(d)
+    
+    # 3. 变体猜测（基于已知域名的后缀/前缀）
+    base_domains = list(domains)
+    for d in base_domains:
+        ext = tld_extract(d)
+        if not ext.domain or not ext.suffix:
+            continue
+        base = ext.domain
+        
+        variants = [
+            f"{base}.com.cn", f"{base}.cn", f"{base}.net", f"{base}.org",
+            f"{base}-global.com", f"{base}-group.com", f"{base}-china.com",
+            f"{base}-cn.com", f"{base}-corp.com", f"{base}-tech.com",
+            f"{base}-auto.com", f"{base}auto.com", f"{base}china.com",
+            f"{base}cn.com", f"{base}corp.com", f"{base}global.com",
+            f"{base}group.com", f"{base}holdings.com", f"{base}tech.com",
+        ]
+        for v in variants:
+            if v != d:
+                domains.add(v)
+    
+    return domains
+
+def verify_domains(domains, timeout=HTTP_TIMEOUT):
+    """验证域名是否可达（HTTP 或 DNS）"""
+    valid = []
+    for domain in domains:
+        # 先 DNS 解析
+        ip = resolve_dns(domain)
+        if ip:
+            # 再尝试 HTTP 访问
+            try:
+                req = Request(f"http://{domain}", method='HEAD',
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+                resp = urlopen(req, timeout=timeout)
+                valid.append({'domain': domain, 'ip': ip, 'http': resp.status})
+            except HTTPError as e:
+                valid.append({'domain': domain, 'ip': ip, 'http': e.code})
+            except:
+                valid.append({'domain': domain, 'ip': ip, 'http': None})
+    return valid
+
+# ============= 子域名枚举 =============
+def load_subdomain_dict():
+    """加载 DNS 字典"""
+    if os.path.exists(DICT_FILE):
+        with open(DICT_FILE, 'r') as f:
+            return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    
+    # 内置字典（如果文件不存在）
+    return [
+        'www', 'mail', 'api', 'admin', 'test', 'dev', 'staging', 'portal', 'app',
+        'cdn', 'static', 'login', 'sso', 'partner', 'crm', 'erp', 'uat', 'vpn',
+        'data', 'files', 'images', 'media', 'docs', 'wiki', 'support', 'help',
+        'blog', 'news', 'careers', 'jobs', 'hr', 'finance', 'account', 'pay',
+        'shop', 'store', 'search', 'service', 'download', 'upload', 'ftp', 'ssh',
+        'gateway', 'proxy', 'firewall', 'lb', 'k8s', 'docker', 'registry',
+        'jenkins', 'gitlab', 'git', 'jira', 'confluence', 'intranet', 'extranet',
+        'internal', 'external', 'public', 'private', 'secure', 'access', 'auth',
+        'identity', 'key', 'secret', 'user', 'customer', 'client',
+        'sales', 'marketing', 'analytics', 'monitor', 'log', 'audit', 'policy',
+        'documentation', 'doc', 'ref', 'knowledge', 'kb', 'faq', 'helpdesk',
+        'ticket', 'issue', 'bug', 'incident', 'event', 'alert', 'error', 'request',
+        'work', 'project', 'task', 'case', 'board', 'pipeline', 'release',
+        'deploy', 'build', 'ci', 'cd', 'staging', 'prod', 'production', 'live',
+        'beta', 'alpha', 'rc', 'preview', 'experiment', 'lab', 'playground',
+        'sandbox', 'space', 'workspace', 'team', 'group', 'department', 'org',
+        'business', 'subdomain', 'third', 'third-party', 'partner', 'associate',
+        'vendor', 'supplier', 'provider', 'integrator', 'reseller', 'distributor',
+        'dealer', 'agent', 'representative', 'area', 'region', 'global', 'cn',
+        'china', 'us', 'usa', 'uk', 'eu', 'asia', 'jp', 'kr', 'de', 'fr', 'au',
+        'north', 'south', 'east', 'west', 'central', 'hq', 'headquarter', 'office',
+        'factory', 'plant', 'workshop', 'warehouse', 'logistics', 'supply', 'chain',
+        'purchase', 'procurement', 'buyer', 'vendor', 'supplier', 'source',
+        'material', 'component', 'parts', 'assembly', 'production', 'manufacturing',
+        'mfg', 'engineering', 'eng', 'design', 'rd', 'research', 'development',
+        'tech', 'technology', 'innovation', 'quality', 'qc', 'qa', 'inspection',
+        'test', 'testing', 'verification', 'validation', 'compliance', 'regulatory',
+        'legal', 'ip', 'patent', 'trademark', 'copyright', 'standard', 'spec',
+        'specification', 'drawing', 'blueprint', 'model', 'prototype', 'sample',
+        'pilot', 'trial', 'batch', 'lot', 'serial', 'barcode', 'rfid', 'iot',
+        'sensor', 'device', 'machine', 'equipment', 'tool', 'fixture', 'mold',
+        'die', 'casting', 'forge', 'stamp', 'weld', 'paint', 'coat', 'surface',
+        'heat', 'treatment', 'machine', 'cnc', 'lathe', 'mill', 'drill', 'press',
+        'robot', 'automation', 'auto', 'plc', 'scada', 'mes', 'dcs', 'erp', 'aps',
+        'wms', 'tms', 'oms', 'srm', 'qms', 'lims', 'cms', 'ems', 'bms', 'fms',
+        'hcm', 'hrm', 'crm', 'scm', 'plm', 'pdm', 'capp', 'cam', 'cad', 'cae',
+        'catia', 'ug', 'proe', 'solidworks', 'autocad', 'revit', 'bim', 'gis',
+        'nav', 'gps', 'tracking', 'fleet', 'vehicle', 'car', 'truck', 'ship',
+        'container', 'cargo', 'freight', 'shipping', 'transport', 'transit',
+        'dispatch', 'route', 'warehouse', 'wh', 'dc', 'distribution', 'fulfillment',
+        'inventory', 'stock', 'shelf', 'rack', 'bin', 'pallet', 'carton', 'box',
+        'package', 'parcel', 'mail', 'express', 'courier', 'delivery', 'logistics',
+        'supply', 'demand', 'forecast', 'plan', 'schedule', 'planning', 'scheduling',
+        'mps', 'mrp', 'drp', 'crp', 'srp', 'aps', 'lp', 'mip', 'sdp', 'vrp',
+        'tsp', 'csp', 'psp', 'rsp', 'lsp', 'isp', 'asp', 'csp', 'msp', 'ssp',
+        'cloud', 'paas', 'saas', 'iaas', 'faas', 'baas', 'daas', 'maas', 'naas',
+        'xaas', 'api', 'openapi', 'rest', 'graphql', 'grpc', 'soap', 'rpc',
+        'websocket', 'sse', 'mqtt', 'amqp', 'kafka', 'redis', 'mysql', 'postgres',
+        'mongodb', 'cassandra', 'neo4j', 'elasticsearch', 'solr', 'sphinx',
+        'memcached', 'rabbitmq', 'activemq', 'zeromq', 'nats', 'pulsar', 'rocketmq',
+        'etcd', 'consul', 'zookeeper', 'nacos', 'eureka', 'ribbon', 'hystrix',
+        'feign', 'zuul', 'gateway', 'sentinel', 'skywalking', 'pinpoint',
+        'cat', 'zipkin', 'jaeger', 'prometheus', 'grafana', 'kibana', 'elk',
+        'beats', 'filebeat', 'metricbeat', 'packetbeat', 'heartbeat', 'auditbeat',
+        'logstash', 'fluentd', 'fluentbit', 'vector', 'telegraf', 'collector',
+        'exporter', 'agent', 'daemon', 'probe', 'scanner', 'sensor', 'agent',
+        'client', 'node', 'worker', 'executor', 'runner', 'scheduler', 'cron',
+        'timer', 'trigger', 'event', 'handler', 'processor', 'consumer', 'producer',
+    ]
+
+def enumerate_crtsh(main_domain, timeout=CRT_TIMEOUT):
+    """crt.sh 证书透明度日志收集"""
+    results = set()
     try:
-        url = f"https://crt.sh/?q=%.{urllib.parse.quote(domain)}&output=json"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-            for entry in data:
-                names = entry.get('name_value', '').split('\n')
-                for name in names:
+        url = f"https://crt.sh/?q=%.{main_domain}&output=json"
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        resp = urlopen(req, timeout=timeout)
+        data = json.loads(resp.read().decode('utf-8'))
+        for entry in data:
+            if 'name_value' in entry:
+                for name in entry['name_value'].split('\n'):
                     name = name.strip().lower()
-                    if name and domain in name and '*' not in name:
-                        subdomains.add(name)
+                    if name and not name.startswith('*') and name.endswith(main_domain):
+                        results.add(name)
+                    elif name.startswith('*.'):
+                        results.add(name[2:])
+        return results
     except Exception as e:
-        print(f"  [crt.sh] {domain} 失败: {e}", file=sys.stderr)
-    return subdomains
+        print(f"  [crt.sh] {main_domain} 失败: {e}")
+        return results
 
-def enumerate_subdomains_subfinder(domain, timeout=120):
-    """使用 subfinder 枚举子域名"""
-    subdomains = set()
+def enumerate_subfinder(main_domain, timeout=SUBFINDER_TIMEOUT):
+    """subfinder 子域名枚举"""
+    results = set()
     try:
         result = subprocess.run(
-            ['subfinder', '-d', domain, '-silent', '-timeout', '10', '-max-time', '2'],
+            ['subfinder', '-d', main_domain, '-silent', '-all'],
             capture_output=True, text=True, timeout=timeout
         )
         for line in result.stdout.strip().split('\n'):
             line = line.strip().lower()
-            if line and domain in line:
-                subdomains.add(line)
+            if line:
+                results.add(line)
+        return results
     except Exception as e:
-        print(f"  [subfinder] {domain} 失败: {e}", file=sys.stderr)
-    return subdomains
+        print(f"  [subfinder] {main_domain} 失败: {e}")
+        return results
 
-def dns_brute_subdomains(domain, wordlist=None):
-    """基于字典的 DNS 爆破（轻量版）"""
-    if wordlist is None:
-        wordlist = ['www', 'mail', 'ftp', 'api', 'admin', 'test', 'dev', 'staging',
-                    'portal', 'app', 'mobile', 'cdn', 'static', 'img', 'assets',
-                    'secure', 'vpn', 'remote', 'web', 'blog', 'shop', 'store',
-                    'support', 'help', 'docs', 'wiki', 'forum', 'chat', 'video',
-                    'media', 'news', 'events', 'careers', 'jobs', 'hr',
-                    'login', 'auth', 'sso', 'account', 'user', 'member',
-                    'partner', 'vendor', 'supplier', 'b2b', 'b2c',
-                    'cn', 'en', 'us', 'eu', 'asia', 'global', 'intl',
-                    'server1', 'server2', 'web1', 'web2', 'db', 'backup',
-                    'crm', 'erp', 'oa', 'm', 'wap', '3g', '4g', '5g',
-                    'wechat', 'wx', 'mp', 'mini', 'open', 'gateway', 'gw',
-                    'service', 'services', 'serv', 'svc', 'ms', 'micro',
-                    'cloud', 'c', 'data', 'd', 'analytics', 'tracking', 'trace',
-                    'monitor', 'mon', 'prometheus', 'grafana', 'kibana', 'elastic',
-                    'jenkins', 'ci', 'cd', 'git', 'gitlab', 'github', 'repo',
-                    'nexus', 'maven', 'npm', 'pypi', 'docker', 'registry',
-                    'k8s', 'kube', 'kubernetes', 'cluster', 'node', 'pod',
-                    'internal', 'intranet', 'private', 'corp', 'local',
-                    'uat', 'pre', 'preprod', 'preview', 'beta', 'alpha', 'gamma',
-                    'demo', 'sandbox', 'playground', 'try', 'lab',
-                    'old', 'legacy', 'v1', 'v2', 'v3', 'version', 'release',
-                    'download', 'dl', 'files', 'file', 'upload', 'up',
-                    'ws', 'wsdl', 'soap', 'rest', 'graphql', 'rpc', 'grpc',
-                    'health', 'status', 'ping', 'ready', 'alive', 'check',
-                    'config', 'conf', 'settings', 'env', 'vars', 'secrets',
-                    'api1', 'api2', 'api3', 'gateway1', 'gateway2',
-                    'search', 'es', 'solr', 'lucene', 'index', 'catalog',
-                    'cache', 'redis', 'memcached', 'session', 'sessions',
-                    'queue', 'mq', 'kafka', 'rabbit', 'rabbitmq', 'celery',
-                    'db1', 'db2', 'db3', 'mysql', 'postgres', 'mongo', 'mariadb',
-                    'sql', 'oracle', 'mssql', 'cassandra', 'couch', 'neo4j',
-                    'ftp', 'sftp', 'ssh', 'rdp', 'vnc', 'telnet', 'smtp',
-                    'pop', 'imap', 'exchange', 'mx', 'ns', 'ns1', 'ns2',
-                    'dns', 'dns1', 'dns2', 'resolver', 'bind', 'unbound',
-                    'ntp', 'time', 'clock', 'snmp', 'syslog', 'log', 'logs',
-                    'audit', 'auditlog', 'security', 'sec', 'soc', 'siem',
-                    'firewall', 'fw', 'ids', 'ips', 'waf', 'cdn', 'edge',
-                    'lb', 'loadbalancer', 'haproxy', 'nginx', 'apache', 'iis',
-                    'proxy', 'proxies', 'squid', 'varnish', 'traefik', 'kong',
-                    'router', 'switch', 'gateway', 'net', 'network',
-                    'stage', 'staging', 'staging1', 'staging2', 'uat', 'sit',
-                    'dev1', 'dev2', 'dev3', 'test1', 'test2', 'test3',
-                    'qa', 'qc', 'qual', 'validation', 'verify', 'cert']
+def enumerate_dns_brute(main_domain, words, max_workers=MAX_WORKERS):
+    """DNS 字典爆破"""
+    results = set()
+    subdomains = [f"{w}.{main_domain}" for w in words]
     
-    subdomains = set()
-    socket.setdefaulttimeout(3)
-    for sub in wordlist:
-        subdomain = f"{sub}.{domain}"
-        try:
-            socket.gethostbyname(subdomain)
-            subdomains.add(subdomain)
-        except socket.gaierror:
-            pass
-    return subdomains
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_sub = {executor.submit(resolve_dns, sub): sub for sub in subdomains}
+        for future in concurrent.futures.as_completed(future_to_sub):
+            sub = future_to_sub[future]
+            try:
+                ip = future.result()
+                if ip:
+                    results.add(sub)
+            except:
+                pass
+    return results
 
+def enumerate_permutations(main_domain, words):
+    """排列组合生成额外子域名"""
+    results = set()
+    
+    # 常见组合模式
+    patterns = ['{a}-{b}', '{a}{b}', '{a}_{b}', '{a}-{b}-v1', '{a}-{b}-v2',
+                '{a}-{b}-prod', '{a}-{b}-test', '{a}-{b}-dev',
+                'v1-{a}-{b}', 'v2-{a}-{b}', 'api-{a}-{b}',
+                '{a}-{b}-cn', '{a}-{b}-us', '{a}-{b}-eu',
+                '{a}-{b}-1', '{a}-{b}-2', '{a}-{b}-01', '{a}-{b}-02']
+    
+    # Top 50 高频前缀
+    top_words = ['www', 'mail', 'api', 'admin', 'test', 'dev', 'staging', 'portal',
+                 'app', 'cdn', 'static', 'login', 'sso', 'vpn', 'data', 'files',
+                 'images', 'media', 'docs', 'wiki', 'support', 'help', 'blog',
+                 'news', 'careers', 'jobs', 'hr', 'finance', 'pay', 'shop',
+                 'store', 'search', 'service', 'download', 'upload', 'ftp',
+                 'gateway', 'proxy', 'firewall', 'lb', 'k8s', 'docker',
+                 'jenkins', 'gitlab', 'git', 'jira', 'intranet', 'extranet',
+                 'internal', 'external', 'public', 'private', 'secure',
+                 'access', 'auth', 'identity', 'key', 'secret', 'user',
+                 'customer', 'client', 'sales', 'marketing', 'analytics',
+                 'monitor', 'log', 'audit', 'policy', 'documentation']
+    
+    for a in top_words:
+        for b in top_words:
+            if a != b:
+                for p in patterns:
+                    sub = p.format(a=a, b=b)
+                    results.add(f"{sub}.{main_domain}")
+    
+    return results
+
+def enumerate_recursive(subdomains, main_domain, words, max_depth=2):
+    """递归子域名枚举（从已发现的子域名继续）"""
+    all_found = set(subdomains)
+    current = set(subdomains)
+    
+    for depth in range(1, max_depth + 1):
+        next_level = set()
+        for sub in current:
+            # 从 subdomain.main.com 中，对 subdomain 部分继续枚举
+            prefix = sub.replace(f".{main_domain}", "")
+            for w in words[:50]:  # 限制递归范围，避免爆炸
+                new_sub = f"{w}.{sub}"
+                if new_sub not in all_found and new_sub.endswith(main_domain):
+                    next_level.add(new_sub)
+        
+        if not next_level:
+            break
+        
+        # 验证新发现的子域名
+        valid = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_sub = {executor.submit(resolve_dns, sub): sub for sub in next_level}
+            for future in concurrent.futures.as_completed(future_to_sub):
+                sub = future_to_sub[future]
+                try:
+                    if future.result():
+                        valid.add(sub)
+                except:
+                    pass
+        
+        all_found.update(valid)
+        current = valid
+        print(f"  [递归深度{depth}] 发现 {len(valid)} 个新子域名")
+    
+    return all_found
+
+def classify_subdomain(subdomain):
+    """子域名分类"""
+    sub = subdomain.lower().split('.')[0]
+    
+    production = ['www', 'app', 'api', 'cdn', 'static', 'shop', 'store', 'portal', 'public', 'prod']
+    testing = ['test', 'dev', 'staging', 'uat', 'beta', 'alpha', 'rc', 'preview', 'demo', 'pilot', 'experiment', 'lab', 'sandbox', 'playground']
+    management = ['admin', 'manage', 'manager', 'dashboard', 'console', 'control', 'panel', 'backend', 'system', 'sys', 'monitor', 'ops', 'administrator', 'root', 'super', 'master']
+    api = ['api', 'openapi', 'rest', 'graphql', 'grpc', 'ws', 'websocket', 'service', 'services', 'gateway', 'proxy', 'bff', 'middleware', 'endpoint', 'endpoints', 'rpc', 'webhook', 'callback', 'notify', 'notification', 'push', 'pull', 'subscribe', 'publish', 'event', 'stream', 'sse', 'mqtt', 'amqp', 'kafka', 'redis', 'mq', 'queue', 'bus', 'pipe', 'pipeline']
+    infrastructure = ['vpn', 'ftp', 'ssh', 'sftp', 'rdp', 'gateway', 'proxy', 'firewall', 'lb', 'loadbalancer', 'dns', 'ntp', 'dhcp', 'smtp', 'imap', 'pop', 'mail', 'mx', 'ns', 'ns1', 'ns2', 'ns3', 'whois', 'rwhois', 'dns1', 'dns2', 'resolver', 'cdn', 'cache', 'edge', 'node', 'origin', 'mirror', 'repo', 'repository', 'artifact', 'registry', 'harbor', 'nexus', 'artifactory', 'maven', 'npm', 'pypi', 'docker', 'container', 'k8s', 'kubernetes', 'swarm', 'rancher', 'openshift', 'istio', 'envoy', 'traefik', 'nginx', 'apache', 'haproxy', 'varnish', 'squid', 'memcached', 'redis', 'mysql', 'postgres', 'mongodb', 'elasticsearch', 'kafka', 'zookeeper', 'etcd', 'consul', 'vault', 'nacos', 'eureka', 'prometheus', 'grafana', 'kibana', 'logstash', 'fluentd', 'beats', 'collector', 'agent', 'probe', 'sensor', 'scanner', 'monitor', 'alert', 'notification', 'pager', 'ticketing', 'jira', 'confluence', 'wiki', 'git', 'gitlab', 'github', 'bitbucket', 'gitea', 'gogs', 'jenkins', 'ci', 'cd', 'pipeline', 'build', 'deploy', 'release', 'artifact', 'binary', 'package', 'library', 'module', 'component']
+    
+    if sub in production: return 'production'
+    if sub in testing: return 'testing'
+    if sub in management: return 'management'
+    if sub in api: return 'api'
+    if sub in infrastructure: return 'infrastructure'
+    return 'other'
+
+# ============= 主流程 =============
 def main():
     if len(sys.argv) < 2:
-        print("用法: python3 discover_domains.py <公司名或URL> [输出文件]")
+        print("用法: discover_domains.py <输入> [输出JSON]")
+        print("  输入: URL(https://www.example.com) / 域名(www.example.com) / 公司名(华为)")
         sys.exit(1)
     
-    input_str = sys.argv[1]
+    raw_input = sys.argv[1]
     output_file = sys.argv[2] if len(sys.argv) > 2 else None
     
-    # 判断输入是 URL 还是公司名
-    if input_str.startswith('http'):
-        main_domain = extract_main_domain(input_str)
-        company_name = main_domain.split('.')[0]
+    print("=" * 60)
+    print(f"域名资产发现 v2")
+    print(f"输入: {raw_input}")
+    print("=" * 60)
+    
+    # 解析输入
+    mode, _, domain_or_name = parse_input(raw_input)
+    print(f"[模式] {mode}")
+    
+    if mode == 'url':
+        main_domain = extract_main_domain(domain_or_name)
+        company_name = ''
+    elif mode == 'domain':
+        main_domain = extract_main_domain(domain_or_name)
+        company_name = ''
     else:
-        company_name = input_str
-        # 尝试拼音猜测主域名
-        # 对于中文公司名，如果没有硬编码映射，使用通用猜测
-        ascii_name = re.sub(r'[^\x00-\x7f]', '', company_name).lower().replace(' ', '')
-        if ascii_name:
-            main_domain = f"{ascii_name}.com"
+        company_name = domain_or_name
+        main_domain = ''
+    
+    print(f"[主域名] {main_domain}")
+    print(f"[公司名] {company_name}")
+    print("")
+    
+    # ============= Phase 1: 主域名发现 =============
+    print("[阶段1] 主域名资产发现...")
+    
+    if mode == 'company':
+        # 公司名模式：发现关联主域名
+        discovered_domains = discover_main_domains(company_name)
+        print(f"  候选域名: {len(discovered_domains)} 个")
+        
+        # 验证可达性
+        print("  验证可达性...")
+        valid_domains = verify_domains(discovered_domains)
+        
+        # 选择第一个可达的作为主域名
+        if valid_domains:
+            main_domain = valid_domains[0]['domain']
+            print(f"  [主域名] {main_domain} (IP: {valid_domains[0]['ip']})")
         else:
-            # 纯中文且不在映射中，使用占位符（后续会被硬编码映射覆盖或失败）
-            main_domain = "unknown.com"
-    
-    # 检查硬编码映射，如果匹配则使用映射中的第一个域名作为主域名
-    mappings = {
-        '华为': ['huawei.com', 'huawei.cn'],
-        '腾讯': ['tencent.com', 'qq.com'],
-        '阿里': ['alibaba.com', 'aliyun.com'],
-        '字节': ['bytedance.com', 'tiktok.com'],
-        '小米': ['mi.com', 'xiaomi.com'],
-        '比亚迪': ['byd.com', 'byd.com.cn'],
-        '吉利': ['geely.com', 'geely.com.cn'],
-    }
-    for key, domains in mappings.items():
-        if key in company_name or company_name in key:
-            main_domain = domains[0]
-            break
-    
-    print(f"[*] 输入: {input_str}")
-    print(f"[*] 主域名: {main_domain}")
-    print(f"[*] 公司名: {company_name}")
-    
-    # 阶段1: 发现关联主域名
-    print(f"\n[阶段1] 发现关联主域名...")
-    related_domains = discover_related_domains(company_name, main_domain)
-    
-    # 验证可达性
-    valid_domains = []
-    for domain in sorted(related_domains):
-        reachable, ip = check_domain_reachable(domain)
-        if reachable:
-            print(f"  [✓] {domain} → {ip}")
-            valid_domains.append(domain)
+            print("  [警告] 所有候选域名都不可达，尝试使用第一个候选")
+            if discovered_domains:
+                main_domain = list(discovered_domains)[0]
+    else:
+        # URL/域名模式：直接验证
+        ip = resolve_dns(main_domain)
+        if ip:
+            print(f"  [主域名] {main_domain} (IP: {ip})")
         else:
-            print(f"  [✗] {domain} (不可达)")
+            print(f"  [警告] {main_domain} DNS 不可解析")
+        valid_domains = [{'domain': main_domain, 'ip': ip or 'N/A', 'http': None}]
     
-    if not valid_domains:
-        print(f"  [!] 未找到可达的关联域名，使用主域名: {main_domain}")
-        valid_domains = [main_domain]
+    print(f"  有效主域名: {len(valid_domains)} 个")
+    for d in valid_domains[:5]:
+        status = d.get('http', 'N/A')
+        print(f"    {d['domain']} → {d['ip']} (HTTP: {status})")
+    print("")
     
-    # 阶段2: 子域名枚举
-    print(f"\n[阶段2] 子域名枚举...")
+    # ============= Phase 2: 子域名枚举 =============
+    print("[阶段2] 子域名枚举...")
+    print(f"  目标主域名: {main_domain}")
+    
     all_subdomains = set()
     
-    for domain in valid_domains:
-        print(f"  -> 枚举 {domain} ...")
-        
-        # 2.1 crt.sh
-        print(f"      [crt.sh]...", end='', flush=True)
-        crt_sh = enumerate_subdomains_crtsh(domain)
-        print(f" {len(crt_sh)} 个")
-        all_subdomains.update(crt_sh)
-        
-        # 2.2 subfinder
-        print(f"      [subfinder]...", end='', flush=True)
-        sf = enumerate_subdomains_subfinder(domain)
-        print(f" {len(sf)} 个")
-        all_subdomains.update(sf)
-        
-        # 2.3 DNS 字典爆破
-        print(f"      [DNS字典]...", end='', flush=True)
-        dns = dns_brute_subdomains(domain)
-        print(f" {len(dns)} 个")
-        all_subdomains.update(dns)
+    # 2.1 crt.sh
+    print("  [crt.sh] 证书透明度日志...")
+    crt_results = enumerate_crtsh(main_domain)
+    print(f"    发现 {len(crt_results)} 个")
+    all_subdomains.update(crt_results)
     
-    # 去重并过滤
-    final_subdomains = set()
-    for sub in all_subdomains:
-        sub = sub.lower().strip()
-        if sub and '.' in sub:
-            # 过滤掉 IP 和通配符
-            if '*' not in sub and not re.match(r'\d+\.\d+\.\d+\.\d+', sub):
-                final_subdomains.add(sub)
+    # 2.2 subfinder
+    print("  [subfinder] 开源情报收集...")
+    subfinder_results = enumerate_subfinder(main_domain)
+    print(f"    发现 {len(subfinder_results)} 个")
+    all_subdomains.update(subfinder_results)
     
-    print(f"\n[*] 总计发现 {len(final_subdomains)} 个唯一子域名/域名")
+    # 2.3 DNS 字典爆破
+    print("  [DNS字典] 加载字典...")
+    words = load_subdomain_dict()
+    print(f"    字典大小: {len(words)} 个前缀")
     
-    # 输出
-    results = {
-        'input': input_str,
-        'company_name': company_name,
+    print("  [DNS字典] 爆破中...")
+    dns_results = enumerate_dns_brute(main_domain, words)
+    print(f"    发现 {len(dns_results)} 个")
+    all_subdomains.update(dns_results)
+    
+    # 2.4 排列组合
+    print("  [排列组合] 生成组合子域名...")
+    perm_results = enumerate_permutations(main_domain, words)
+    print(f"    生成 {len(perm_results)} 个候选...")
+    # 验证排列组合（只验证一部分，避免太慢）
+    perm_sample = list(perm_results)[:200]  # 限制样本量
+    valid_perms = set()
+    for p in perm_sample:
+        if resolve_dns(p):
+            valid_perms.add(p)
+    print(f"    验证通过 {len(valid_perms)} 个")
+    all_subdomains.update(valid_perms)
+    
+    # 2.5 递归子域名枚举
+    print("  [递归枚举] 深度2...")
+    recursive_results = enumerate_recursive(all_subdomains, main_domain, words, max_depth=2)
+    print(f"    递归后总计 {len(recursive_results)} 个")
+    all_subdomains = recursive_results
+    
+    print(f"  子域名去重后: {len(all_subdomains)} 个")
+    print("")
+    
+    # ============= Phase 3: 验证与分类 =============
+    print("[阶段3] 验证与分类...")
+    
+    verified = []
+    for sub in sorted(all_subdomains):
+        ip = resolve_dns(sub)
+        if ip:
+            verified.append({
+                'subdomain': sub,
+                'ip': ip,
+                'category': classify_subdomain(sub)
+            })
+    
+    # 分类统计
+    categories = {}
+    for v in verified:
+        cat = v['category']
+        categories[cat] = categories.get(cat, 0) + 1
+    
+    print(f"  DNS 可解析: {len(verified)} 个")
+    for cat, count in sorted(categories.items(), key=lambda x: -x[1]):
+        print(f"    {cat}: {count}")
+    print("")
+    
+    # ============= 输出 =============
+    result = {
+        'input': raw_input,
+        'mode': mode,
         'main_domain': main_domain,
-        'related_domains': valid_domains,
-        'all_subdomains': sorted(final_subdomains)
+        'company_name': company_name,
+        'valid_domains': valid_domains,
+        'subdomains': {
+            'total_unique': len(all_subdomains),
+            'dns_resolvable': len(verified),
+            'by_category': categories,
+            'list': verified,
+        },
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     }
     
-    print(f"\n[关联主域名] ({len(valid_domains)} 个):")
+    if output_file:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        print(f"[输出] 结果已保存到 {output_file}")
+    
+    # 打印摘要
+    print("=" * 60)
+    print("摘要")
+    print("=" * 60)
+    print(f"主域名: {main_domain}")
+    print(f"关联主域名: {len(valid_domains)} 个")
+    print(f"唯一子域名: {len(all_subdomains)}")
+    print(f"DNS 可解析: {len(verified)}")
+    print("")
+    print("Top 20 子域名:")
+    for v in verified[:20]:
+        print(f"  {v['subdomain']} → {v['ip']} [{v['category']}]")
+    
+    # 打印 domains.txt 格式（用于后续扫描）
+    print("")
+    print("domains.txt 格式:")
+    urls = set()
     for d in valid_domains:
-        print(f"  - {d}")
-    
-    print(f"\n[子域名] ({len(final_subdomains)} 个):")
-    for sub in sorted(final_subdomains)[:50]:  # 只显示前50
-        print(f"  - {sub}")
-    if len(final_subdomains) > 50:
-        print(f"  ... 以及另外 {len(final_subdomains) - 50} 个")
-    
-    if output_file:
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"\n[+] 结果已保存: {output_file}")
-    
-    # 同时输出纯文本列表（每行一个URL，用于脚本后续处理）
-    if output_file:
-        txt_file = output_file.replace('.json', '.txt')
-        with open(txt_file, 'w') as f:
-            for sub in sorted(final_subdomains):
-                f.write(f"https://{sub}\n")
-        print(f"[+] URL列表已保存: {txt_file}")
+        urls.add(f"https://{d['domain']}")
+    for v in verified:
+        urls.add(f"https://{v['subdomain']}")
+    for url in sorted(urls):
+        print(f"  {url}")
 
 if __name__ == '__main__':
     main()
